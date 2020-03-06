@@ -1,0 +1,280 @@
+---
+title: "Untitled"
+author: "Ying Huang"
+date: "8/20/2019"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(TSA)
+library(tseries)
+library(fpp)
+library(forecast)
+library(vars)
+```
+
+## Read Rick and Morty Data
+```{r}
+project.ts <- readRDS("~/Documents/GitHub/TimeSeries-Project/TSProject/new_train.rds")
+project.ts <- ts(project.ts)
+rick_morty_es <- ts(as.numeric(project.ts[,'rick_y_morty']))
+rick_morty_es <- window(rick_morty_es,start=400)
+rick_morty_en <- ts(as.numeric(project.ts[,'rick_and_morty']))
+rick_morty_en <- window(rick_morty_en,start=400)
+```
+
+### Plot the data
+```{r}
+RickMorty <- cbind(Spanish = rick_morty_es, English = rick_morty_en)
+tsdisplay(RickMorty)
+```
+Since we analyse the trend of this data, we truncate the data from time 400 because it is flat before 400. We can see from the plot that Spanish page and English page almost have the same pattern, though they are on the different magnitude level. And we can see the increasement of the variance and slightly upward trending. So we can expect the future traffic of Spanish will also influnced by English page with upwarding trend and higher variance. From we ACP and PACF plot we expect frequency to be 7, and MA to be 1. 
+
+### Prepare the dataset, transform it to weekly dataset.
+```{r}
+rick_morty_es_weekly <- ts(rick_morty_es, frequency = 7)
+tsdisplay(rick_morty_es_weekly)
+```
+
+### Split train and test data
+```{r}
+es_weekly_train <- window(rick_morty_es_weekly,end=c(55,7))
+es_weekly_test <- window(rick_morty_es_weekly,start=c(56,1))
+h <- 19
+```
+We split the train and test data here, and keep the test set untouched later. 
+
+
+### Data Transforming.  
+```{r}
+lambda_weekly <- BoxCox.lambda(es_weekly_train)
+lambda_weekly
+weekly_train <- BoxCox(es_weekly_train,lambda_weekly)
+tsdisplay(weekly_train)
+#check stationary
+kpss.test(weekly_train)
+kpss.test(diff(weekly_train)) #pass level
+kpss.test(diff(weekly_train),null = 'Trend') #pass trend
+adf.test(diff(weekly_train))
+#we need d=1
+tsdisplay(diff(weekly_train))
+```
+We preform BoxCox transformation and check the stationality. The data need 1 difference to become stationery. 
+
+
+# Fit the model
+## Start with Auto.Arima.
+```{r}
+arima.fit <- auto.arima(weekly_train,d=1,seasonal = TRUE) #211,200
+arima.fit$aicc #-2469.01
+arima.fit$aic #-2469.24
+summary(arima.fit)
+checkresiduals(arima.fit) #white noise
+```
+
+### Prediction from auto arima
+```{r}
+autoarima <- forecast(arima.fit,h)
+autoplot(autoarima) 
+automean <- InvBoxCox(autoarima$mean,lambda_weekly)
+autoplot(automean)+autolayer(es_weekly_test)
+sqrt(sum((es_weekly_test-automean)^2)/h) #327.0045
+auto <- accuracy(automean,es_weekly_test)
+```
+Prediction catches some of the seasonality, but not the peak magnitude. 
+
+
+## Arima from eacf
+```{r}
+eacf(weekly_train)
+arima212 <- Arima(weekly_train,order=c(2,1,2),seasonal = list(order=c(2,0,0)))
+arima212 #Aic -2468.07
+arima312 <- Arima(weekly_train,order=c(3,1,2),seasonal = list(order=c(2,0,0))) #Aic -2467.41
+arima312
+checkresiduals(arima212) #white noise
+arima212fit <- forecast(arima212,h)
+autoplot(arima212fit) 
+arimamean <- InvBoxCox(arima212fit$mean,lambda_weekly)
+autoplot(arimamean)+autolayer(es_weekly_test)
+sqrt(sum((es_weekly_test-arimamean)^2)/h) #345.6329
+arima <- accuracy(arimamean,es_weekly_test)
+```
+Similar result as SARIMA. 
+
+
+## Xreg
+```{r}
+rick_morty_en_weekly <- ts(rick_morty_en, frequency = 7)
+tsdisplay(rick_morty_en_weekly)
+en_weekly_train <- window(rick_morty_en_weekly,end=c(55,7))
+en_weekly_test <- window(rick_morty_en_weekly,start=c(56,1))
+
+lambda_en_weekly <- BoxCox.lambda(en_weekly_train)
+en_weekly_trans <- BoxCox(rick_morty_en_weekly,lambda_en_weekly)
+en_weekly_trans_diff <- diff(en_weekly_trans)
+en_weekly_train_trans <- window(en_weekly_trans_diff, end=c(55,7))
+en_weekly_test_trans <- window(en_weekly_trans_diff, start=c(56,1))
+
+
+tsdisplay(en_weekly_train_trans)
+kpss.test(en_weekly_train_trans)
+kpss.test(en_weekly_train_trans, null = 'Trend')
+
+xreg.fit <- auto.arima(diff(weekly_train),seasonal = TRUE,xreg = en_weekly_train_trans)
+xreg.fit$aic #-2566.89
+summary(xreg.fit) 
+checkresiduals(xreg.fit) #white noise
+```
+For the regression with ARIMA, we need to take the time-series data of English page to the stationery as well, and we also need to take difference before split the English page data set.  Pretty good result fot the residual. 
+
+
+### Prediction from Xreg
+```{r}
+xreg <- forecast(xreg.fit,h,xreg=en_weekly_test_trans)
+xreg2 <- append(weekly_train[385],xreg$mean)
+xreg.cumsum <- cumsum(xreg2)
+xregmean2 <- InvBoxCox(xreg.cumsum[2:20],lambda_weekly)
+
+plot(xregmean2,type='l',ylim=c(1400,3100)) + lines(as.numeric(es_weekly_test), col='red')
+sqrt(sum((es_weekly_test-xregmean2)^2)/h) #246.6643
+xreg <- accuracy(xregmean2,es_weekly_test)
+
+```
+Now, we see the prediction is much more similar to the true data. 
+ 
+## VARMA model
+```{r}
+
+data <- cbind(diff(weekly_train),en_weekly_train_trans)
+VARselect(data,type = 'both')
+var.fit <- VAR(data,p=7,type = 'both')
+var.fit
+AIC(var.fit) #-10114.87
+acf(residuals(var.fit)[,1])
+acf(residuals(var.fit)[,2]) #english trains still have spikes. 
+varfit <- forecast(var.fit,h)
+autoplot(varfit) 
+
+varfit.cum <- append(weekly_train[385],varfit$forecast$diff.weekly_train$mean)
+varfit.cumsum <- cumsum(varfit.cum)
+varfit.cumsum
+
+varmean <- InvBoxCox(varfit.cumsum[2:20],lambda_weekly)
+
+plot(varmean, type='l',ylim=c(1400,3100)) + lines(as.numeric(es_weekly_test), col='red')
+sqrt(sum((es_weekly_test-varmean)^2)/h) #380.8135
+var <- accuracy(varmean,es_weekly_test)
+```
+It seems like VAR predict the english page difference better than the Spanish page difference. While when we transform it back to the normal data, it seems not good as others. 
+
+
+## Naive method
+```{r}
+naive <- naive(weekly_train,h)
+autoplot(naive)
+naivemean <- InvBoxCox(naive$mean,lambda_weekly)
+autoplot(naivemean) + autolayer(es_weekly_test)
+sqrt(sum((es_weekly_test-naivemean)^2)/h) #490.2889
+naiveacc <- accuracy(naivemean,es_weekly_test)
+
+snaive <- snaive(weekly_train,h)
+autoplot(snaive)
+snaivemean <- InvBoxCox(snaive$mean,lambda_weekly)
+autoplot(snaivemean) + autolayer(es_weekly_test)
+sqrt(sum((es_weekly_test-snaivemean)^2)/h) #402.7447
+snaiveacc <- accuracy(snaivemean,es_weekly_test)
+
+```
+
+
+## Holt-Winter
+```{r}
+hw1 <- hw(weekly_train,h,seasonal = 'additive', damped = TRUE)
+hw2 <- hw(weekly_train,h,seasonal = 'multi', damped = TRUE)
+hw3 <- hw(weekly_train,h,seasonal = 'addi', damped = FALSE)
+hw4 <- hw(weekly_train,h,seasonal = 'multi', damped = FALSE)
+summary(hw1) #-1266.789
+summary(hw2) #-1278.316 
+summary(hw3) #-1279.266 choose this one
+summary(hw4) #-1256.880
+checkresiduals(hw3) #failed
+autoplot(hw3)
+
+hwmean <- InvBoxCox(hw3$mean,lambda_weekly)
+autoplot(hwmean) + autolayer(es_weekly_test)
+hwacc <- accuracy(hwmean,es_weekly_test) #276.3999
+```
+
+## ETS
+```{r}
+ets <- ets(weekly_train, model = 'ZZA') #AAA
+summary(ets) #AIC -1279.266 
+checkresiduals(ets) #failed
+autoplot(ets)
+
+etsfit <- forecast(ets,h)
+autoplot(etsfit) 
+etsmean <- InvBoxCox(etsfit$mean,lambda_weekly)
+autoplot(etsmean)+autolayer(es_weekly_test)
+sqrt(sum((es_weekly_test-etsmean)^2)/h) #276.3999
+etsacc <- accuracy(etsmean,es_weekly_test)
+```
+Same as holt-winter. 
+
+## TBATS
+```{r}
+tbats(weekly_train) #AIC -1301.029
+```
+
+
+
+## Fourier & harmonic
+```{r}
+#install.packages('fpp2')
+library(fpp2)
+harmonics <- fourier(weekly_train, K=3)
+fit <- auto.arima(weekly_train,xreg=harmonics,seasonal = FALSE)
+summary(fit) #aic -2498.96
+checkresiduals(fit)
+
+newharmonics <- fourier(weekly_train, K=3,h)
+harmonicfit <- forecast(fit,h,xreg = newharmonics)
+autoplot(harmonicfit) 
+harmonicmean <- InvBoxCox(harmonicfit$mean,lambda_weekly)
+autoplot(harmonicmean) + autolayer(es_weekly_test)
+sqrt(sum((es_weekly_test-harmonicmean)^2)/h) #222.4694
+harmonic <- accuracy(harmonicmean,es_weekly_test)
+
+```
+Fourier transformation and Dynamic Harnomic has the best prediction, though the residual is not as good as Xreg. 
+
+
+# Comparasion
+```{r}
+comparasion <- rbind(Auto = auto, Arima = arima,Xreg = xreg, VAR = var, Naive = naiveacc, SNaive = snaiveacc, harmonic,hwacc, etsacc)
+comparasion <- as.data.frame(comparasion, row.names = c('AutoArima','Arima212','Regression with En','VAR','Naive','SNaive','Dynamic Harmonic','Holt-Winters','ETS'))
+comparasion
+
+```
+
+
+
+# Choose Dynamic Harmonic and Forecasting 
+```{r}
+lambda <- BoxCox.lambda(rick_morty_es_weekly)
+es_trans <- BoxCox(rick_morty_es_weekly,lambda)
+harmonics_es <- fourier(es_trans, K=3)
+fit_es <- auto.arima(es_trans,xreg=harmonics_es,seasonal = FALSE)
+
+newharmonics_es <- fourier(es_trans, K=3,30)
+fit30 <- forecast(fit_es,30,xreg = newharmonics_es)
+autoplot(fit30) 
+
+```
+Actually, for the all the prediction, they can predict the trend and the seasonality, but they are not good at predict the variance. 
+
+
